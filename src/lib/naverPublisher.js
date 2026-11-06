@@ -986,12 +986,56 @@ async function selectNativeCategory(page, category) {
   return false;
 }
 
+// The button span's testid follows the selected board (e.g. 발효이야기=_1,
+// 건강 트렌드=_8), so read [data-testid^='categoryItemText'] scoped to the button.
+async function readPublishCategoryValue(page) {
+  return page.evaluate(() => {
+    const btn = document.querySelector("button[aria-label='카테고리 목록 버튼']");
+    const span = btn ? btn.querySelector("[data-testid^='categoryItemText']") : null;
+    return span ? (span.innerText || span.textContent || "").trim() : "";
+  }).catch(() => "");
+}
+
+async function selectPublishCategory(page, category, log) {
+  const target = String(category || "").trim();
+  if (!target) return false;
+  try {
+    const button = page.locator("button[aria-label='카테고리 목록 버튼'], [data-click-area='tpb*i.category']").first();
+    if (!(await button.isVisible().catch(() => false))) return false;
+    const current = await readPublishCategoryValue(page);
+    if (current.trim() === target) return true;
+    await button.click({ timeout: 5000 }).catch(() => null);
+    await page.waitForTimeout(1500);
+    const clicked = await page.evaluate((boardName) => {
+      const items = [...document.querySelectorAll("[data-testid^='categoryItemText']")];
+      const item = items.find((el) => (el.innerText || el.textContent || "").trim() === boardName && el.offsetParent !== null);
+      if (!item) return false;
+      item.scrollIntoView({ block: "nearest" });
+      item.click();
+      return true;
+    }, target);
+    if (!clicked) return false;
+    await page.waitForTimeout(1200);
+    const after = await readPublishCategoryValue(page);
+    if (after.trim() === target) {
+      log(`카테고리를 선택했습니다. (${target})`);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 async function selectCategory(page, selectors, category, log) {
   const target = String(category || "").trim();
   if (!target) return false;
 
   if (await selectNativeCategory(page, target)) {
     log("카테고리를 선택했습니다.");
+    return true;
+  }
+  if (await selectPublishCategory(page, target, log)) {
     return true;
   }
 
@@ -2782,6 +2826,8 @@ module.exports = {
     waitForLoginComplete,
     assertNaverSessionActive,
     completeLoginIfNeeded,
-    verifyPostWriteSession
+    verifyPostWriteSession,
+    selectCategory,
+    selectPublishCategory
   }
 };
