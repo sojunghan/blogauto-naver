@@ -2567,6 +2567,11 @@ async function publishToNaver(options) {
       await assertNaverSessionActive(page, selectors, log, "저장", sessionRecoveryOptions);
     }
 
+    if (options.saveDraftOnly === true) {
+      log("임시저장만 진행하고 발행 단계는 건너뜁니다.");
+      break;
+    }
+
     await assertNaverSessionActive(page, selectors, log, "발행 설정 열기 전", sessionRecoveryOptions);
     }
     const publishOpened = await clickPublishSettingsButton(page, selectors, log);
