@@ -1929,6 +1929,22 @@ function stripDuplicateTitleLine(article, title) {
   return lines.join("\n").trim();
 }
 
+function parseMarkdownTableLines(lines) {
+  const rows = [];
+  for (const line of lines) {
+    const cells = line
+      .trim()
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((cell) => cell.trim());
+    // Skip the separator row (|---|---|) — every cell is dashes/colons.
+    if (cells.length && cells.every((cell) => /^:?-{2,}:?$/.test(cell))) continue;
+    if (cells.length) rows.push(cells);
+  }
+  return rows;
+}
+
 function splitArticleBlocks(article) {
   const rawBlocks = String(article || "")
     .split(/(\[IMAGE INSERT - \d+\])/g)
@@ -1948,7 +1964,21 @@ function splitArticleBlocks(article) {
       .map((paragraph) => paragraph.trim())
       .filter(Boolean);
 
-    for (const paragraph of paragraphs) {
+    for (let index = 0; index < paragraphs.length; index += 1) {
+      const paragraph = paragraphs[index];
+      if (paragraph.startsWith("|")) {
+        const tableLines = [paragraph];
+        while (index + 1 < paragraphs.length && paragraphs[index + 1].startsWith("|")) {
+          index += 1;
+          tableLines.push(paragraphs[index]);
+        }
+        const rows = parseMarkdownTableLines(tableLines);
+        if (rows.length) {
+          blocks.push({ type: "table", rows });
+          continue;
+        }
+      }
+
       const section = paragraph.match(sectionPattern);
       if (section) {
         blocks.push({ type: "section", text: section[1].trim() });
@@ -1960,6 +1990,149 @@ function splitArticleBlocks(article) {
   }
 
   return blocks;
+}
+
+const TABLE_SELECTOR = ".se-document-content table, .se-component-content table, table";
+const TABLE_TOOLBAR_BUTTON_SELECTOR = ".se-table-toolbar-button";
+const TABLE_DEFAULT_ROWS = 3;
+const TABLE_DEFAULT_COLS = 3;
+
+async function getEditorTableInfo(page) {
+  return page.evaluate((selector) => {
+    const tables = Array.from(document.querySelectorAll(selector));
+    if (!tables.length) return null;
+    const table = tables[tables.length - 1];
+    const rows = Array.from(table.querySelectorAll("tr")).map((tr) =>
+      Array.from(tr.querySelectorAll("td, th")).map((cell) => {
+        const rect = cell.getBoundingClientRect();
+        return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+      })
+    );
+    const box = table.getBoundingClientRect();
+    return {
+      rows: rows.length,
+      cols: rows.length ? rows[0].length : 0,
+      cells: rows,
+      box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
+    };
+  }, TABLE_SELECTOR);
+}
+
+async function clickTableAddButton(page, label, log) {
+  // Use a Playwright locator click (not precomputed coordinates): the page
+  // scrolls as the table grows, so viewport coordinates queried earlier go
+  // stale and the click misses the button, leaving the row count unchanged.
+  // locator.click() scrolls the button into view and recomputes its
+  // position at click time. Match the label exactly (substring matching
+  // would confuse e.g. "2행" with "12행" on larger tables).
+  const buttons = page.locator("button.se-cell-add-button");
+  const count = await buttons.count().catch(() => 0);
+  for (let index = 0; index < count; index += 1) {
+    const item = buttons.nth(index);
+    const text = (await item.innerText().catch(() => "")).trim();
+    if (text !== label) continue;
+    await item.click({ timeout: 8000 });
+    await sleep(600);
+    return true;
+  }
+  log(`표 추가 버튼을 찾지 못했습니다: ${label}`, "warn");
+  return false;
+}
+
+async function isSelectionInTable(page) {
+  return page.evaluate(() => {
+    const selection = window.getSelection();
+    if (!selection || !selection.anchorNode) return false;
+    const node = selection.anchorNode.nodeType === 3 ? selection.anchorNode.parentElement : selection.anchorNode;
+    return Boolean(node && node.closest && node.closest("table"));
+  });
+}
+
+async function insertTable(page, rows, log) {
+  const targetRows = rows.length;
+  const targetCols = rows.length ? rows[0].length : 0;
+  if (!targetRows || !targetCols) throw new Error("표에 넣을 행/열이 없습니다.");
+  if (targetRows < TABLE_DEFAULT_ROWS || targetCols < TABLE_DEFAULT_COLS) {
+    throw new Error(`표는 최소 ${TABLE_DEFAULT_ROWS}행 ${TABLE_DEFAULT_COLS}열이어야 합니다. (요청: ${targetRows}행 ${targetCols}열)`);
+  }
+  log(`표 삽입 시작 (${targetRows}행 ${targetCols}열)`);
+
+  const toolbarButton = page.locator(TABLE_TOOLBAR_BUTTON_SELECTOR).first();
+  await safeClickLocator(page, toolbarButton, log, "표 추가 버튼");
+  await sleep(1200);
+  let info = await getEditorTableInfo(page);
+  if (!info) throw new Error("표 추가 버튼을 눌렀지만 표가 삽입되지 않았습니다.");
+  log(`기본 표 삽입됨 (${info.rows}행 ${info.cols}열)`);
+
+  let guard = 0;
+  while (info.rows < targetRows) {
+    guard += 1;
+    if (guard > 20) throw new Error("표 행 추가가 20회를 초과했습니다.");
+    const label = `${info.rows - 1}행 다음에 행 추가`;
+    const clicked = await clickTableAddButton(page, label, log);
+    if (!clicked) throw new Error(`행 추가 버튼을 찾지 못했습니다: ${label}`);
+    info = await getEditorTableInfo(page);
+    if (!info) throw new Error("행 추가 후 표를 찾지 못했습니다.");
+  }
+
+  guard = 0;
+  while (info.cols < targetCols) {
+    guard += 1;
+    if (guard > 20) throw new Error("표 열 추가가 20회를 초과했습니다.");
+    const label = `${info.cols - 1}열 다음에 열 추가`;
+    const clicked = await clickTableAddButton(page, label, log);
+    if (!clicked) throw new Error(`열 추가 버튼을 찾지 못했습니다: ${label}`);
+    info = await getEditorTableInfo(page);
+    if (!info) throw new Error("열 추가 후 표를 찾지 못했습니다.");
+  }
+  log(`표 크기 조정 완료 (${info.rows}행 ${info.cols}열)`);
+
+  for (let r = 0; r < targetRows; r += 1) {
+    info = await getEditorTableInfo(page);
+    if (!info || info.rows < targetRows || info.cols < targetCols) {
+      throw new Error("셀 입력 중 표 크기가 달라졌습니다.");
+    }
+    // Click each cell via a Playwright locator (not precomputed coordinates):
+    // the page scrolls as the table grows, so viewport coordinates queried
+    // earlier go stale and land a row lower. locator.click() scrolls the
+    // cell into view and recomputes its position at click time.
+    const tableLocator = page.locator(TABLE_SELECTOR).last();
+    for (let c = 0; c < targetCols; c += 1) {
+      const cellLocator = tableLocator.locator("tr").nth(r).locator("td, th").nth(c);
+      await cellLocator.click();
+      await sleep(250);
+      const value = rows[r][c] || "";
+      if (value) {
+        await page.keyboard.type(value, { delay: 60 });
+        await sleep(150);
+      }
+    }
+    log(`표 ${r + 1}행 입력 완료`);
+  }
+
+  info = await getEditorTableInfo(page);
+  if (info) {
+    // Scroll the table into view first: the click-below point can sit below
+    // the visible viewport on a tall table, and a mouse click at off-screen
+    // coordinates does not place the cursor.
+    await page.locator(TABLE_SELECTOR).last().scrollIntoViewIfNeeded().catch(() => {});
+    await sleep(400);
+    info = await getEditorTableInfo(page);
+  }
+  if (info) {
+    const x = Math.round((info.box.left + info.box.right) / 2);
+    await page.mouse.click(x, Math.round(info.box.bottom) + 40);
+    await sleep(500);
+    if (await isSelectionInTable(page)) {
+      await page.keyboard.press("ArrowDown").catch(() => {});
+      await sleep(400);
+    }
+    if (await isSelectionInTable(page)) {
+      await page.keyboard.press("End").catch(() => {});
+      await sleep(400);
+    }
+  }
+  log("표 삽입 완료");
 }
 
 async function insertArticleWithImages(page, selectors, article, bodyImages, options, log) {
@@ -1982,6 +2155,15 @@ async function insertArticleWithImages(page, selectors, article, bodyImages, opt
 
     if (block.type === "section") {
       await insertSectionHeadingBlock(page, selectors, block.text, log);
+      continue;
+    }
+
+    if (block.type === "table") {
+      await page.keyboard.press("Enter");
+      await page.keyboard.press("Enter");
+      await insertTable(page, block.rows, log);
+      await page.keyboard.press("Enter");
+      await page.keyboard.press("Enter");
       continue;
     }
 
@@ -2828,6 +3010,9 @@ module.exports = {
     completeLoginIfNeeded,
     verifyPostWriteSession,
     selectCategory,
-    selectPublishCategory
+    selectPublishCategory,
+    splitArticleBlocks,
+    parseMarkdownTableLines,
+    insertTable
   }
 };
