@@ -295,13 +295,58 @@ async function typeIntoLocator(page, locator, text, log = () => {}, label = "입
   log(`${label} 완료`);
 }
 
+// Split text on **...** markers into plain/bold segments. Unmatched ** are
+// stripped so they never appear literally in the editor. A bold span is a
+// short phrase inside one sentence; it never spans a sentence boundary, so
+// parsing per sentence (breakSentencesInBody) is safe.
+function parseBoldSegments(text) {
+  const value = String(text || "");
+  const segments = [];
+  const pattern = /\*\*([^*]+?)\*\*/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = pattern.exec(value)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ text: value.slice(lastIndex, match.index), bold: false });
+    }
+    segments.push({ text: match[1], bold: true });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < value.length) {
+    segments.push({ text: value.slice(lastIndex), bold: false });
+  }
+  // Strip any leftover unmatched ** markers.
+  return segments
+    .map((seg) => ({ text: seg.text.replace(/\*\*/g, ""), bold: seg.bold }))
+    .filter((seg) => seg.text);
+}
+
+async function typeSegmentsWithBold(page, segments) {
+  for (const segment of segments) {
+    if (!segment.text) continue;
+    if (!segment.bold) {
+      await page.keyboard.type(segment.text, { delay: 75 + Math.floor(Math.random() * 45) });
+      continue;
+    }
+    // Bold segment: toggle bold on, type it, toggle bold off. Toggling
+    // around the text (instead of selecting it after typing) keeps bold
+    // from leaking into the following plain text. The old select-then-bold
+    // approach left the cursor inside bold formatting, so everything after
+    // the first bold span came out bold.
+    await page.keyboard.press("Meta+b");
+    await sleep(120);
+    await page.keyboard.type(segment.text, { delay: 75 + Math.floor(Math.random() * 45) });
+    await page.keyboard.press("Meta+b");
+    await sleep(120);
+  }
+}
+
 async function typeAtCurrentCursor(page, text, log = () => {}, label = "입력") {
   const value = String(text || "");
   log(`${label} 시작`);
+  const segments = parseBoldSegments(value);
   await withTimeout(
-    page.keyboard.type(value, {
-      delay: 75 + Math.floor(Math.random() * 45)
-    }),
+    typeSegmentsWithBold(page, segments),
     Math.max(15000, value.length * 250),
     `${label} 제한 시간을 초과했습니다.`
   );
@@ -2027,11 +2072,21 @@ async function clickTableAddButton(page, label, log) {
   // would confuse e.g. "2행" with "12행" on larger tables).
   const buttons = page.locator("button.se-cell-add-button");
   const count = await buttons.count().catch(() => 0);
+  // With several tables in the article, every table has an add button with
+  // the same label (e.g. "2행 다음에 행 추가"). The table being built is
+  // always the last one, so click the LAST matching button, not the first.
+  let target = null;
   for (let index = 0; index < count; index += 1) {
     const item = buttons.nth(index);
     const text = (await item.innerText().catch(() => "")).trim();
-    if (text !== label) continue;
-    await item.click({ timeout: 8000 });
+    if (text === label) target = item;
+  }
+  if (target) {
+    // The SmartEditor sidebar (se-sidebar) can overlay the add-row /
+    // add-column buttons and swallow a real pointer click (force-click
+    // still lands on the overlay). Dispatch the click directly on the
+    // button element instead, so the overlay cannot intercept it.
+    await target.evaluate((el) => el.click());
     await sleep(600);
     return true;
   }
